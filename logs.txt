@@ -1,0 +1,8 @@
+## turn 1 - 260903:1600
+```
+ssh hoangnv242@10.254.152.71
+tmux new -s tts_hoangnv242
+mkdir -p /mnt/data/hoangnv242/{envs,huggingface,projects,datasets,outputs,bench}
+srun --job-name=tts-dev-hoangnv242 --nodes=1 --gres=gpu:1 --partition=main \
+  --cpus-per-task=16 --mem=128G --pty bash
+```
