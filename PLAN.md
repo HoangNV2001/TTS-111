@@ -336,7 +336,11 @@ EOF
 
 ```bash
 mkdir -p /etc/slurm /var/spool/slurmctld /var/spool/slurmd /var/log/slurm
-rm -f /var/spool/slurmctld/clustername    # tránh CLUSTER NAME MISMATCH từ config cũ của gói apt
+
+# ⚠️ XOÁ TOÀN BỘ state cũ, không chỉ file clustername.
+# Gói apt 23.11 đã ghi state ở đây; 23.02 KHÔNG đọc được (version 10240 > 9984)
+# và sẽ fatal: "Can not recover assoc_usage state, incompatible version".
+rm -f /var/spool/slurmctld/*
 
 cat > /etc/slurm/slurm.conf <<'EOF'
 ClusterName=vastbox
@@ -346,6 +350,7 @@ SlurmdUser=root
 
 AuthType=auth/munge
 CredType=cred/munge
+MailProg=/bin/true
 
 StateSaveLocation=/var/spool/slurmctld
 SlurmdSpoolDir=/var/spool/slurmd
@@ -422,6 +427,21 @@ tail -30 /var/log/slurm/slurmctld.log
 scontrol update NodeName=localhost State=RESUME    # sau khi đã sửa nguyên nhân
 ```
 
+### Bốn lỗi hay gặp ở bước này
+
+| Triệu chứng | Nguyên nhân | Sửa |
+|---|---|---|
+| `slurm_load_partitions: Unable to contact slurm controller` | `slurmctld` không chạy | xem `/var/log/slurm/slurmctld.log`, hoặc chạy `slurmctld -D` để thấy lỗi trực tiếp |
+| `fatal: Can not recover assoc_usage state, incompatible version, got 10240 need <= 9984` | state của 23.11 còn sót | `rm -f /var/spool/slurmctld/*` rồi khởi động lại |
+| `fatal: CLUSTER NAME MISMATCH ... read "localcluster"` | state của config mặc định gói apt | như trên |
+| `error: Node configuration differs from hardware: CPUs=16:64(hw)` | `slurm.conf` chép từ máy khác | sửa `CPUs/Sockets/CoresPerSocket/ThreadsPerCore` cho khớp `lscpu` |
+
+Hai cảnh báo **vô hại**, cứ bỏ qua:
+```text
+error: High latency for 1000 calls to gettimeofday()   ← host dùng chung, không phải lỗi config
+error: Configured MailProg is invalid                   ← đã tắt bằng MailProg=/bin/true
+```
+
 ### 0.3.9. Cho daemon sống qua restart (supervisor)
 
 ```bash
@@ -482,6 +502,25 @@ squeue                       # rỗng
 
 → Xác nhận bằng tay điều đã bàn: **lệnh chạy xong ≠ job xong**.
 
+⚠️ **Đừng quên `exit`.** Nếu bạn để shell này sống rồi đi làm việc khác, nó giữ GPU và mọi job sau xếp hàng sau lưng nó — đúng thứ đã làm tắc cluster HPC. `--time` là phanh tay, không phải cái cớ để quên.
+
+### Bẫy: `srun` bên trong allocation hành xử khác
+
+```text
+srun từ shell thường        → tạo JOB mới, xin tài nguyên mới
+srun bên trong allocation   → tạo STEP trong job hiện tại, dùng lại tài nguyên đã cấp
+```
+
+Gõ `srun ...` khi đang ở trong `--pty bash` sẽ **không** xin GPU mới. Triệu chứng hay gặp khi làm sai:
+```text
+srun: error: Unable to create step for job N: Job/step already completing or completed
+```
+
+Luôn kiểm tra trước khi gõ `srun`:
+```bash
+echo $SLURM_JOB_ID      # rỗng = shell thường (đúng) · có số = đang trong job
+```
+
 ### Bài 3 — Queueing thật với 1 GPU
 
 ```bash
@@ -494,7 +533,13 @@ done
 squeue -o "%.8i %.10j %.2t %.10M %.12l %.18b %.20R"
 ```
 
-Kỳ vọng: 1 job `R`, 2 job `PD` với `REASON=(Resources)`. Đợi rồi xem chúng chạy lần lượt.
+Kỳ vọng: 1 job `R`, 2 job `PD` (`(Resources)` cho job kế tiếp, `(Priority)` cho các job sau nữa). Theo dõi chúng chạy lần lượt:
+
+```bash
+watch -n 5 'squeue -o "%.6i %.10j %.2t %.10M %.12l %.20R"'
+```
+
+> Nếu thấy job lạ đang `R` chiếm GPU, kiểm tra xem có phải shell Bài 2 chưa `exit` không. Dọn hết: `scancel -u root`.
 
 → Đây chính là cơ chế đã bắt bạn chờ trên HPC, nhưng lần này bạn thấy toàn cảnh trong 3 phút.
 
@@ -545,13 +590,31 @@ cat /var/log/slurm/jobcomp.log                     # lịch sử (thay cho sacct
 
 ## 0.5. Python env + PyTorch
 
+⚠️ **Dùng `cu129`, KHÔNG dùng `cu128`** như README của OmniVoice khuyến nghị.
+
+Lý do: FlashInfer từ chối sm_120 khi build CUDA < 12.9 —
+```text
+Failed to get device capability: SM 12.x requires CUDA >= 12.9.
+TARGET_CUDA_ARCHS = set()
+→ RuntimeError: FlashInfer requires GPUs with sm75 or higher
+```
+Thông báo lỗi gây hiểu nhầm (sm_120 > sm_75), nhưng gốc rễ là `TARGET_CUDA_ARCHS` rỗng vì CUDA 12.8 không đủ cho Blackwell. Đã kiểm chứng trên máy này.
+
+Giữ nguyên torch **2.8.0** (đúng version README), chỉ đổi build CUDA:
+
 ```bash
 source /workspace/tts/env.sh
-uv pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 \
-  --extra-index-url https://download.pytorch.org/whl/cu128
+uv pip install torch==2.8.0+cu129 torchaudio==2.8.0+cu129 \
+  --extra-index-url https://download.pytorch.org/whl/cu129
 
 df -h /        # kiểm tra đĩa NGAY sau bước này
 ```
+
+> Nếu đã lỡ cài cu128, gỡ trước cho nhẹ đĩa:
+> ```bash
+> uv pip uninstall torch torchaudio
+> uv cache clean
+> ```
 
 Verify qua Slurm (chứ không chạy thẳng — practice):
 
@@ -581,35 +644,109 @@ df -h /
 
 > Cài `-e .` để Phase 2–5 còn đọc và sửa `omnivoice/models/omnivoice_flashinfer.py`.
 
-## 0.7. 🚨 Probe sm_120 + FlashInfer — LÀM NGAY, ĐỪNG HOÃN
+## 0.7. FlashInfer trên sm_120 — ĐÃ GIẢI QUYẾT
 
-Toàn bộ Phase 2 (trái tim của plan) dựa trên FlashInfer. FlashInfer lịch sử tối ưu cho sm_80/sm_90 (A100/H100); **có kernel cho sm_120 Blackwell hay không là câu hỏi chưa có lời đáp**. Biết sớm thì còn xoay, biết muộn thì phí công dựng harness.
+> **Kết quả: chạy được.** Nhưng mất 4 vòng chẩn đoán. Ghi lại đầy đủ vì đây là kiểu vấn đề bạn sẽ gặp lại mỗi khi dùng GPU mới hơn stack phần mềm.
 
-```bash
-uv pip install flashinfer-python==0.6.15.post1 "flashinfer-jit-cache==0.6.15.post1+cu128" \
-  --extra-index-url https://flashinfer.ai/whl/cu128/
+### 0.7.0. Chuỗi chẩn đoán (để hiểu, không phải để chạy lại)
 
-srun --time=00:10:00 --gres=gpu:1 python -c "
-import torch, flashinfer
-print('flashinfer', flashinfer.__version__)
-print('cap', torch.cuda.get_device_capability(0))
-import flashinfer.jit as J
-print('jit ok')
-"
-df -h /
+```text
+flashinfer + cu128
+      ↓
+RuntimeError: FlashInfer requires GPUs with sm75 or higher     ← thông báo LẠC HƯỚNG
+      ↓ đọc jit/core.py:96-108
+check_cuda_arch() duyệt TARGET_CUDA_ARCHS, rỗng thì ném lỗi trên
+      ↓ in ra
+TARGET_CUDA_ARCHS = set()
+"Failed to get device capability: SM 12.x requires CUDA >= 12.9"
+      ↓ đổi torch sang cu129 → VẪN LỖI
+      ↓ đọc jit/cpp_ext.py:68-80
+get_cuda_version() chạy $CUDA_HOME/bin/nvcc --version  ← đọc TOOLKIT, không phải torch
+      ↓ nvcc hệ thống = 12.8
+      ↓ thử ép FLASHINFER_CUDA_ARCH_LIST="12.0f"
+nvcc fatal: Unsupported gpu architecture 'compute_120f'        ← suffix 'f' là tính năng CUDA 12.9
+      ↓
+KẾT LUẬN: bắt buộc phải có nvcc >= 12.9
 ```
 
-Ba kết cục có thể xảy ra:
+Ba bài học:
 
-| Kết cục | Nghĩa là | Ta làm gì |
-|---|---|---|
-| import OK, kernel chạy | 🎉 tốt nhất | Phase 2 giữ nguyên |
-| import OK nhưng JIT compile lâu/lỗi lúc chạy thật | thiếu prebuilt kernel cho sm_120 | thử build JIT tại chỗ, chấp nhận warmup lâu |
-| không hỗ trợ sm_120 | Phase 2 phải đổi trục | chuyển trọng tâm sang `torch.compile` + CUDA Graph thuần PyTorch + `num_step` — vẫn học được inference optimization, chỉ khác công cụ |
+1. **Thông báo lỗi có thể trỏ sai chỗ hoàn toàn.** "requires sm75 or higher" trên GPU sm120 — triệu chứng thật là một tập rỗng. Đọc source nhanh hơn đoán.
+2. **`torch.version.cuda` ≠ CUDA toolkit.** torch mang runtime riêng; thư viện nào cần *biên dịch* kernel thì đọc `nvcc`. Hai thứ này lệch nhau được.
+3. **`nvidia-cuda-nvcc-cu12` trên PyPI chỉ có `ptxas`**, không có `nvcc`. Muốn nvcc thật phải lấy từ apt repo của NVIDIA.
 
-Kể cả kết cục xấu nhất, plan **không chết** — mục tiêu là học tối ưu inference, FlashInfer chỉ là một đường đi.
+### 0.7.1. Công thức (đã verify)
 
-📥 **Gửi tôi output của bước này trước khi đi tiếp.**
+```bash
+# (1) torch cu129 — xem §0.5
+# (2) nvcc 12.9, chỉ ~300 MB, KHÔNG cần cả toolkit
+cd /tmp
+curl -sLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+dpkg -i cuda-keyring_1.1-1_all.deb
+apt-get update -qq
+apt-get install -y cuda-nvcc-12-9 cuda-cudart-dev-12-9
+/usr/local/cuda-12.9/bin/nvcc --version | tail -2      # phải là release 12.9
+```
+
+```bash
+# (3) trỏ CUDA_HOME vào 12.9 — KHÔNG đổi symlink /usr/local/cuda
+cat >> /workspace/tts/env.sh <<'EOF'
+export CUDA_HOME=/usr/local/cuda-12.9
+export PATH=$CUDA_HOME/bin:$PATH
+EOF
+source /workspace/tts/env.sh
+```
+
+> Không sửa symlink `/usr/local/cuda` (đang trỏ 12.8) vì gói 12.9 ta cài chỉ có nvcc + cudart-dev, thiếu phần còn lại của toolkit. `srun`/`sbatch` mặc định là `--export=ALL` nên `CUDA_HOME` trong shell sẽ tự truyền vào job.
+
+```bash
+# (4) flashinfer khớp cu129
+uv pip install flashinfer-python==0.6.18.post1 "flashinfer-jit-cache==0.6.18.post1+cu129" \
+  --extra-index-url https://flashinfer.ai/whl/cu129/
+```
+
+### 0.7.2. Probe — dùng đúng API mà OmniVoice dùng
+
+⚠️ Đừng probe bằng `single_prefill_with_kv_cache`: nó **không** có trong jit-cache (0/906 file) nên sẽ rơi xuống JIT và làm bạn tưởng là hỏng. OmniVoice thật sự dùng:
+
+```text
+flashinfer.BatchPrefillWithRaggedKVCacheWrapper   ← ragged attention
+flashinfer.norm.rmsnorm
+flashinfer.rope.apply_rope_pos_ids_inplace
+flashinfer.activation.silu_and_mul
+```
+
+Script `bench/probe_flashinfer.py` (xem trong repo trên server) dùng đúng bộ này. Chạy:
+
+```bash
+srun --time=00:20:00 --gres=gpu:1 --cpus-per-task=16 \
+  python $TTS_ROOT/bench/probe_flashinfer.py
+```
+
+Kết quả tham chiếu trên RTX 5080 (2026-09-06):
+
+```text
+GPU: NVIDIA GeForce RTX 5080 (12, 0)
+flashinfer 0.6.18.post1
+first call (plan+run): 0.17s
+flashinfer ragged : 0.201 ms/call
+SDPA (x2 seq)     : 0.239 ms/call
+speedup           : 1.19x
+max|diff| vs SDPA : 0.000244140625
+rmsnorm       : (4096, 1024)
+silu_and_mul  : (4096, 1024)
+```
+
+📌 **1.19× chỉ là một op attention đơn lẻ — đừng nhầm với 2.1–2.6× của upstream.** Con số upstream đến từ cả pipeline:
+
+```text
+CFG sequence packing   → bỏ padding giữa cond/uncond    ← phần lớn lợi ích
+fused RMSNorm/RoPE/GEMM → giảm số kernel launch
+ragged attention       → phần bạn vừa đo, 1.19x
+CUDA Graph             → giảm launch overhead ở batch=1
+```
+
+Nghĩa là Phase 2 phải đo **end-to-end**, không phải cộng dồn speedup từng op. Và trên 5080 (băng thông và FLOPS thấp hơn H100 nhiều) tỉ lệ có thể khác — cứ đo rồi kết luận.
 
 ## 0.8. Smoke test — qua `sbatch`
 

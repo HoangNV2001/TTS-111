@@ -34,17 +34,17 @@
 | CPU / RAM | 64 core (Threadripper PRO 5975WX) · 251 GB |
 | GPU | 1× RTX 5080 · 16 GB VRAM · **compute_cap 12.0 (sm_120 Blackwell)** |
 | Driver | 595.71.05 |
-| CUDA toolkit | 12.8 (nvcc có sẵn) → wheel `cu128` |
+| CUDA toolkit | 12.8 mặc định + **cuda-nvcc-12-9 cài thêm** · `CUDA_HOME=/usr/local/cuda-12.9` |
 | Disk | overlay **32 GB** ← ràng buộc chặt nhất |
 | Persistent? | **KHÔNG** (`workspace_is_volume=false`) — recycle/destroy là mất sạch |
 | Python | `/venv/main` 3.12.14 (dùng thẳng, không tạo venv riêng vì tiết kiệm đĩa) |
 | TTS_ROOT | `/workspace/tts` |
 | HF_HOME | `/workspace/.hf_home` |
 | Slurm | **23.02.8 build từ source** tại `/opt/slurm` · `cgroup/v1` + cây giả `/var/lib/slurmcg` · `MaxTime=12:00:00` `DefaultTime=01:00:00` · đã verify job GPU + queueing + TIMEOUT |
-| torch | `?` (dự kiến 2.8.0+cu128, cần `sm_120` trong `arch_list`) |
+| torch | **2.8.0+cu129** (đổi từ cu128 — xem Q3) · `capability (12,0)` · `arch_list` có `sm_120` |
 | omnivoice | `?` (pyproject upstream ghi 0.2.1) |
 | OmniVoice commit | `?` |
-| flashinfer | `?` — **sm_120 support chưa rõ, probe ở Phase 0.7** |
+| flashinfer | **0.6.18.post1 + jit-cache cu129** ✅ chạy được trên sm_120 (cần nvcc 12.9) |
 
 ---
 
@@ -174,6 +174,42 @@ Công thức đầy đủ đã ghi vào PLAN §0.3 (đã verify từng bước).
 
 ---
 
+### 2026-09-06 — Gỡ được rào cản FlashInfer trên Blackwell sm_120
+
+**Kết quả: FlashInfer chạy được.** Rủi ro số 1 của plan đã đóng.
+
+Mất 4 vòng chẩn đoán vì thông báo lỗi trỏ sai chỗ:
+
+| Vòng | Triệu chứng | Phát hiện |
+|---|---|---|
+| 1 | `RuntimeError: FlashInfer requires GPUs with sm75 or higher` (trên GPU sm120!) | `jit/core.py:96-108` duyệt `TARGET_CUDA_ARCHS`, tập **rỗng** thì ném lỗi này |
+| 2 | `TARGET_CUDA_ARCHS = set()` + `SM 12.x requires CUDA >= 12.9` | torch đang là cu128 → đổi sang **torch 2.8.0+cu129** |
+| 3 | Vẫn lỗi dù `torch.version.cuda = 12.9` | `jit/cpp_ext.py:68-80` đọc **`$CUDA_HOME/bin/nvcc --version`**, không đọc torch. nvcc hệ thống = 12.8 |
+| 4 | Ép `FLASHINFER_CUDA_ARCH_LIST=12.0f` → `nvcc fatal: Unsupported gpu architecture 'compute_120f'` | suffix `f` là tính năng CUDA 12.9 → **bắt buộc nvcc ≥ 12.9** |
+
+**Fix:** `cuda-nvcc-12-9` + `cuda-cudart-dev-12-9` từ apt repo NVIDIA (~300 MB, không cần cả toolkit) + `CUDA_HOME=/usr/local/cuda-12.9`. Không đổi symlink `/usr/local/cuda`.
+
+**Kết quả probe (RTX 5080):**
+```text
+first call (plan+run): 0.17s
+flashinfer ragged : 0.201 ms/call
+SDPA (x2 seq)     : 0.239 ms/call   → 1.19x
+max|diff| vs SDPA : 0.000244140625
+rmsnorm / silu_and_mul: OK
+```
+
+**Ba bài học ghi lại:**
+1. Thông báo lỗi có thể trỏ sai hoàn toàn — "requires sm75" thực chất là tập arch rỗng. Đọc source nhanh hơn đoán.
+2. `torch.version.cuda` ≠ CUDA toolkit. Thư viện cần *biên dịch* kernel thì đọc `nvcc`.
+3. `nvidia-cuda-nvcc-cu12` trên PyPI **chỉ có `ptxas`**, không có `nvcc`.
+4. Probe sai API cũng cho kết luận sai: `single_prefill_with_kv_cache` không nằm trong jit-cache (0/906 file) nên luôn rơi xuống JIT. OmniVoice dùng `BatchPrefillWithRaggedKVCacheWrapper` + `norm.rmsnorm` + `rope.apply_rope_pos_ids_inplace` + `activation.silu_and_mul`.
+
+⚠️ **1.19× là một op đơn lẻ, KHÔNG phải 2.1-2.6× của upstream.** Con số upstream đến từ cả pipeline (CFG packing bỏ padding + fused kernels + CUDA graph). Phase 2 phải đo end-to-end.
+
+**Bước tiếp theo:** §0.8 smoke test OmniVoice qua sbatch → Phase 1.
+
+---
+
 ### `<ngày>` — `<tiêu đề buổi làm việc>`
 
 **Đã làm**
@@ -195,8 +231,8 @@ Công thức đầy đủ đã ghi vào PLAN §0.3 (đã verify từng bước).
 | # | Câu hỏi | Trạng thái |
 |---|---|---|
 | Q1 | ~~`anhntc2` cache OmniVoice ở đâu~~ | đóng — đã rời HPC |
-| Q2 | Driver 580.126.09 + CUDA 12.8 → wheel `cu128` OK; nhưng torch có `sm_120` trong `arch_list` không? | mở, Phase 0.5 |
-| Q3 | **FlashInfer có kernel cho sm_120 (Blackwell) không?** | **mở — rủi ro số 1, probe ở Phase 0.7** |
+| Q2 | ~~torch có `sm_120` không?~~ | **đóng — CÓ** (`['sm_70','sm_75','sm_80','sm_86','sm_90','sm_100','sm_120']`, verify 2026-09-06) |
+| Q3 | FlashInfer có kernel cho sm_120 không? | **ĐÓNG — CÓ, đã verify 2026-09-06.** Cần torch cu129 **và** nvcc ≥ 12.9 (`cuda-nvcc-12-9`, ~300MB). Ragged attention 0.201 ms/call vs SDPA 0.239 (1.19×), numerics khớp. Công thức ở PLAN §0.7.1 |
 | Q4 | ASR nào chấm WER tiếng Việt đáng tin? WER nền của nó trên audio người thật là bao nhiêu? | mở |
 | Q5 | Repo này có push lên remote không, hay chỉ local + rsync lên server? | mở |
 | Q6 | ~~Bao giờ có GPU trống trên HPC~~ | đóng — đã rời HPC |
