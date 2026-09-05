@@ -29,18 +29,18 @@
 
 | Mục | Giá trị |
 |---|---|
-| Host | `182.224.239.168:52162` · root · container `dd301f17c69f` |
+| Host | `14.227.95.149:33308` · root · container `fd52e2b5d9ec` |
 | OS | Ubuntu 24.04.4 |
-| CPU / RAM | 16 core · 62 GB |
-| GPU | 1× RTX 5070 Ti · 16 GB VRAM · **compute_cap 12.0 (sm_120 Blackwell)** |
-| Driver | 580.126.09 |
+| CPU / RAM | 64 core (Threadripper PRO 5975WX) · 251 GB |
+| GPU | 1× RTX 5080 · 16 GB VRAM · **compute_cap 12.0 (sm_120 Blackwell)** |
+| Driver | 595.71.05 |
 | CUDA toolkit | 12.8 (nvcc có sẵn) → wheel `cu128` |
 | Disk | overlay **32 GB** ← ràng buộc chặt nhất |
 | Persistent? | **KHÔNG** (`workspace_is_volume=false`) — recycle/destroy là mất sạch |
 | Python | `/venv/main` 3.12.14 (dùng thẳng, không tạo venv riêng vì tiết kiệm đĩa) |
 | TTS_ROOT | `/workspace/tts` |
 | HF_HOME | `/workspace/.hf_home` |
-| Slurm | tự dựng single-node · `MaxTime=12:00:00` `DefaultTime=01:00:00` |
+| Slurm | **23.02.8 build từ source** tại `/opt/slurm` · `cgroup/v1` + cây giả `/var/lib/slurmcg` · `MaxTime=12:00:00` `DefaultTime=01:00:00` · đã verify job GPU + queueing + TIMEOUT |
 | torch | `?` (dự kiến 2.8.0+cu128, cần `sm_120` trong `arch_list`) |
 | omnivoice | `?` (pyproject upstream ghi 0.2.1) |
 | OmniVoice commit | `?` |
@@ -128,6 +128,52 @@ StartTime=2026-10-14T17:52:06
 
 ---
 
+### 2026-09-05 — Instance mới; Slurm 23.11 KHÔNG chạy job được trong container
+
+**Hạ tầng mới:** `14.227.95.149:33308` (container `fd52e2b5d9ec`) — RTX 5080 16GB **vẫn sm_120**, 64 core, 251 GB RAM, disk vẫn 32 GB, vẫn `workspace_is_volume=false`.
+
+**Đã làm** — chẩn đoán `slurmctld`/`slurmd` FATAL trong supervisor, test trên config sandbox ở `/tmp` (không đụng config thật), đã dọn sạch sau khi test.
+
+**Bốn lỗi tìm được, ba cái sửa được:**
+
+| # | Lỗi | Sửa |
+|---|---|---|
+| 1 | `CLUSTER NAME MISMATCH` — state file ghi `localcluster` (từ config mặc định của gói) nhưng conf ghi `vastbox` | `rm /var/spool/slurmctld/clustername` |
+| 2 | `Node configuration differs from hardware: CPUs=16:64(hw)` — conf copy từ instance cũ | `CPUs=64 Sockets=1 CoresPerSocket=32 ThreadsPerCore=2 RealMemory=240000` |
+| 3 | `Ignoring file-less GPU` → node `INVAL`, `gres/gpu count reported lower than configured (0 < 1)` | **`File=/dev/nvidia0` là bắt buộc** trong `gres.conf` (quyết định bỏ `File=` trước đó của tôi sai) |
+| 4 | **cgroup — không sửa được** | xem dưới |
+
+**Lỗi 4 — chặn cứng.** `/sys/fs/cgroup` mount **read-only**, không có systemd/dbus. Slurm 23.11 khởi tạo cgroup **vô điều kiện** dù đã đặt `ProctrackType=proctrack/linuxproc` + `TaskPlugin=task/none`. Đã thử theo thứ tự:
+
+1. `IgnoreSystemd=yes` → hết lỗi dbus, nhưng chết ở `Could not create scope directory /sys/fs/cgroup/...` (read-only)
+2. `CgroupMountPoint=/run/slurmcg` + dựng giả cây cgroup v2 (`cgroup.controllers`, `cgroup.procs`, `system.slice/...`) → **`slurmd version 23.11.4 started`** ✅
+3. Nhưng khi launch job: `slurmstepd` fatal — `Could not move slurmstepd pid to a Slurm's delegated cgroup. Should be in /run/slurmcg/, we are in /run/slurmcg/system.slice/...scope/system`
+
+Bước 3 kiểm tra cgroup **thật** của process qua `/proc/self/cgroup` (`0::/`) và so với cây giả → không giả được. `CgroupPlugin=disabled` **không tồn tại** trong 23.11 (man 5 cgroup.conf chỉ có `cgroup/v1|cgroup/v2|autodetect`).
+
+→ **Kết luận: Slurm 23.11 (bản duy nhất trong apt của Ubuntu 24.04) chạy được daemon nhưng KHÔNG launch được job trong container unprivileged này.**
+
+**Giải pháp — ĐÃ VERIFY end-to-end trên máy:** build **Slurm 23.02.8 từ source** vào `/opt/slurm` (~4 phút, 123 MB).
+
+23.02 vẫn khởi tạo cgroup nhưng **không có bước kiểm tra "delegated cgroup"** của slurmstepd (đó là tính năng mới của 23.11). Chỉ cần trỏ `CgroupPlugin=cgroup/v1` + `CgroupMountpoint=/var/lib/slurmcg` vào một cây thư mục giả là qua.
+
+Kết quả test thật:
+
+| Test | Kết quả |
+|---|---|
+| `slurmd`/`slurmctld` 23.02.8 khởi động | ✅ node `idle` |
+| `srun --gres=gpu:1 nvidia-smi -L` | ✅ `CUDA_VISIBLE_DEVICES=0`, thấy RTX 5080 |
+| Queueing 3 job / 1 GPU | ✅ `q1 R`, `q2 PD (Resources)`, `q3 PD (Priority)` |
+| `--time=00:01:00` với `sleep 300` | ✅ bị giết, `JobState=TIMEOUT`, ctld log `Time limit exhausted for JobId=5` |
+
+Lưu ý phát sinh: **phải gỡ gói apt `slurm-wlm`/`slurm-client`** — client 23.11 nói chuyện với daemon 23.02 sẽ lỗi protocol version. Giữ lại `munge`.
+
+Công thức đầy đủ đã ghi vào PLAN §0.3 (đã verify từng bước). Sandbox test đã dọn sạch, config thật của người dùng chưa bị đụng.
+
+**Bước tiếp theo** — người dùng chạy PLAN §0.3.2 → §0.3.9 (build đã xong sẵn ở /opt/slurm), rồi §0.4 (4 bài practice), rồi §0.7 (probe FlashInfer sm_120).
+
+---
+
 ### `<ngày>` — `<tiêu đề buổi làm việc>`
 
 **Đã làm**
@@ -155,6 +201,7 @@ StartTime=2026-10-14T17:52:06
 | Q5 | Repo này có push lên remote không, hay chỉ local + rsync lên server? | mở |
 | Q6 | ~~Bao giờ có GPU trống trên HPC~~ | đóng — đã rời HPC |
 | Q7 | 32 GB đĩa có đủ tới hết Phase 4 (eval models) không? | mở |
+| Q8 | ~~Slurm 23.02 có tránh được ràng buộc cgroup không?~~ | **đóng — CÓ, đã verify end-to-end 2026-09-05** |
 
 ---
 

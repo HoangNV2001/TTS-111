@@ -1,8 +1,100 @@
 ## turn 1 - 260903:1600
 ```
-ssh hoangnv242@10.254.152.71
-tmux new -s tts_hoangnv242
-mkdir -p /mnt/data/hoangnv242/{envs,huggingface,projects,datasets,outputs,bench}
-srun --job-name=tts-dev-hoangnv242 --nodes=1 --gres=gpu:1 --partition=main \
-  --cpus-per-task=16 --mem=128G --pty bash
+hostname
+slurmd -C
+fd52e2b5d9ec
+NodeName=fd52e2b5d9ec CPUs=64 Boards=1 SocketsPerBoard=1 CoresPerSocket=32 ThreadsPerCore=2 RealMemory=257560
+UpTime=15-00:37:49
+
+cat >/etc/slurm/slurm.conf <<'EOF'
+ClusterName=localcluster
+SlurmctldHost=fd52e2b5d9ec
+
+SlurmUser=slurm
+SlurmdUser=root
+
+AuthType=auth/munge
+SelectType=select/cons_tres
+SelectTypeParameters=CR_Core
+SchedulerType=sched/backfill
+
+StateSaveLocation=/var/spool/slurmctld
+SlurmdSpoolDir=/var/spool/slurmd
+
+SlurmctldPort=6817
+SlurmdPort=6818
+
+NodeName=fd52e2b5d9ec CPUs=64 Boards=1 SocketsPerBoard=1 CoresPerSocket=32 ThreadsPerCore=2 RealMemory=257560 State=UNKNOWN
+PartitionName=debug Nodes=fd52e2b5d9ec Default=YES MaxTime=INFINITE State=UP
+EOF
+
+chown munge:munge /run/munge
+chmod 755 /run/munge
+
+sudo -u munge munged
+
+pgrep -a munged
+munge -n | unmunge
+
+STATUS:          Success (0)
+ENCODE_HOST:     fd52e2b5d9ec (172.17.0.4)
+ENCODE_TIME:     2026-09-05 15:54:48 +0000 (1788623688)
+DECODE_TIME:     2026-09-05 15:54:48 +0000 (1788623688)
+TTL:             300
+CIPHER:          aes128 (4)
+MAC:             sha256 (5)
+ZIP:             none (0)
+UID:             root (0)
+GID:             root (0)
+LENGTH:          0
+
+nvidia-smi
+Sat Sep  5 15:42:01 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 595.71.05              Driver Version: 595.71.05      CUDA Version: 13.2     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 5080        On  |   00000000:02:00.0 Off |                  N/A |
+| 35%   39C    P0             61W /  250W |       2MiB /  16303MiB |    100%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+df -h /
+Filesystem      Size  Used Avail Use% Mounted on
+overlay          32G   38M   32G   1% /
+
+vast-capabilities | jq '.instance.workspace_is_volume'
+
+>>> The output above is this instance's LIVE STATE, not the operating guide.
+>>> Before acting on — or answering questions about — this instance, READ
+>>> /etc/vast-agents-guide.md (also linked as ./AGENTS.md).
+false
+
+source /workspace/tts/env.sh
+Activated conda/uv virtual environment at /venv/main
+(main) root@C.49974590:/workspace$ python -V
+Python 3.12.14
+
+pkill slurmd 2>/dev/null || true
+
+/usr/sbin/slurmd -N fd52e2b5d9ec
+sleep 2
+
+sinfo -N -l
+Sat Sep 05 15:56:25 2026
+NODELIST      NODES PARTITION       STATE CPUS    S:C:T MEMORY TMP_DISK WEIGHT AVAIL_FE REASON              
+fd52e2b5d9ec      1    debug*    unknown* 64     1:32:2 257560        0      1   (null) none 
+
+
 ```

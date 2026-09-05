@@ -27,22 +27,24 @@ Model chủ lực: **OmniVoice** (`k2-fsa/OmniVoice`, Apache-2.0). Lý do chọn
 
 ## 1. Hạ tầng
 
-### 1.1. Hiện tại: Vast.ai instance (khảo sát 2026-09-03)
+### 1.1. Hiện tại: Vast.ai instance (khảo sát 2026-09-05)
 
 ```text
-host          182.224.239.168:52162 · root · container dd301f17c69f
-OS            Ubuntu 24.04.4 · Python 3.12.3 (system) / 3.12.14 (/venv/main)
-CPU/RAM       16 core · 62 GB
-GPU           1× RTX 5070 Ti · 16 GB VRAM · driver 580.126.09 · compute_cap 12.0 (Blackwell sm_120)
-CUDA          toolkit 12.8 có sẵn, nvcc OK → khớp wheel cu128
-disk          overlay 32 GB (dùng 28 MB) ← RÀNG BUỘC CHẶT NHẤT
-venv          /venv/main (image default) · uv có sẵn tại /usr/local/bin/uv
-container     unprivileged Docker · KHÔNG systemd (PID 1 = bash) · KHÔNG cgroup ghi được
-                KHÔNG kernel module / perf / eBPF / docker-in-docker
-services      supervisor quản lý long-running process; caddy reverse-proxy
+host          14.227.95.149:33308 · root · container fd52e2b5d9ec
+OS            Ubuntu 24.04.4 · /venv/main Python 3.12.14 · uv sẵn có
+CPU/RAM       64 core (AMD Threadripper PRO 5975WX, 1 socket / 32 core / 2 thread) · 251 GB
+GPU           1× RTX 5080 · 16 GB VRAM · driver 595.71.05 · compute_cap 12.0 (Blackwell sm_120)
+CUDA          toolkit 12.8, nvcc OK → khớp wheel cu128
+disk          overlay 32 GB ← RÀNG BUỘC CHẶT NHẤT
+container     unprivileged Docker · KHÔNG systemd (PID 1 = bash)
+                /sys/fs/cgroup mount READ-ONLY · không có dbus
+services      supervisor + caddy
+persist       workspace_is_volume = false → recycle/destroy là mất sạch
 network       pypi ✅ github ✅ huggingface ✅ flashinfer.ai ✅
-port forward  ssh -L 8080:localhost:8080 → dùng cho omnivoice-demo sau này
+port forward  ssh -L 8080:localhost:8080
 ```
+
+> Instance trước (`182.224.239.168:52162`, RTX 5070 Ti, 16 CPU) đã đổi. GPU vẫn là Blackwell sm_120 16 GB nên **rủi ro FlashInfer không đổi**; CPU/RAM rộng hơn nhiều (64 core / 251 GB).
 
 ### ⚠️ Ba ràng buộc phải thuộc lòng
 
@@ -223,36 +225,119 @@ python -V
 
 ## 0.3. Dựng Slurm single-node
 
-Ý tưởng: `slurmctld` (scheduler) + `slurmd` (worker daemon) + `munge` (auth) chạy trên cùng một container. Bạn submit job vào chính máy mình đang ngồi.
+⚠️ **Đọc phần này trước khi gõ.** Slurm 23.11 (bản duy nhất trong apt của Ubuntu 24.04) **không launch được job** trong container unprivileged này. Đã kiểm chứng bằng thực nghiệm — chi tiết ở §0.3.0. Ta dùng **Slurm 23.02.8 build từ source** vào `/opt/slurm`.
 
-### 0.3.1. Cài gói
+Toàn bộ công thức dưới đây **đã chạy thật và verify end-to-end trên chính máy này**: job GPU launch được, queueing đúng, `--time` bị enforce thật.
 
-```bash
-apt-get update
-apt-get install -y munge slurm-wlm
-sinfo --version   # kỳ vọng: slurm-wlm 23.11.x
+### 0.3.0. Vì sao không dùng bản apt
+
+```text
+/sys/fs/cgroup  mount READ-ONLY   +   không systemd/dbus
+                      ↓
+Slurm 23.11 khởi tạo cgroup VÔ ĐIỀU KIỆN
+(kể cả khi ProctrackType=proctrack/linuxproc và TaskPlugin=task/none)
+                      ↓
+slurmd start được nếu lừa bằng CgroupMountPoint giả
+                      ↓
+nhưng slurmstepd chết ở MỌI job:
+  "Could not move slurmstepd pid to a Slurm's delegated cgroup.
+   Should be in /run/slurmcg/, we are in /run/slurmcg/system.slice/...scope/system"
 ```
 
-### 0.3.2. Munge — lớp authentication
+Bước cuối đọc cgroup **thật** của process qua `/proc/self/cgroup` (`0::/`) rồi đối chiếu — không giả được. Và `CgroupPlugin=disabled` không tồn tại trong 23.11 (`man 5 cgroup.conf` chỉ có `cgroup/v1|cgroup/v2|autodetect`).
 
-Slurm không nói chuyện được nếu munge chưa chạy. Munge xác thực bằng một khoá bí mật chia sẻ:
+**23.02 khác chỗ nào:** vẫn khởi tạo cgroup, nhưng **không có bước kiểm tra "delegated cgroup"** của slurmstepd. Nên chỉ cần trỏ `cgroup/v1` vào một cây thư mục giả là qua được.
+
+> Đây là bài học đáng giá: rất nhiều tooling HPC ngầm giả định có systemd + cgroup ghi được. Trong container thì giả định đó vỡ.
+
+### 0.3.1. Build Slurm 23.02.8
+
+```bash
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y build-essential libmunge-dev munge
+
+mkdir -p /opt/src && cd /opt/src
+curl -LO https://download.schedmd.com/slurm/slurm-23.02.8.tar.bz2
+tar xjf slurm-23.02.8.tar.bz2 && cd slurm-23.02.8
+
+./configure --prefix=/opt/slurm --sysconfdir=/etc/slurm --disable-debug
+make -j$(nproc)
+make install
+
+/opt/slurm/sbin/slurmctld -V     # kỳ vọng: slurm 23.02.8
+```
+
+⏱ ~3–5 phút với 64 core. Tốn ~123 MB cho `/opt/slurm` + ~353 MB source (xoá `/opt/src` sau nếu cần chỗ).
+
+> `configure` sẽ cảnh báo `unable to link against dbus-1 libraries required for cgroup/v2`. **Đúng như mong muốn** — ta cố ý không muốn plugin v2.
+
+### 0.3.2. Gỡ bản apt để tránh lẫn version
+
+Đây là bước **bắt buộc**, không phải cho gọn. Client 23.11 (`sinfo`/`squeue`/`sbatch` ở `/usr/bin`) nói chuyện với daemon 23.02 sẽ lỗi protocol version. Một shell quên `source env.sh` là bạn dính bẫy này.
+
+```bash
+apt-get remove -y slurm-wlm slurm-client slurmd slurmctld
+apt-get autoremove -y
+dpkg -l | grep -E "^ii.*(slurm|munge)" | awk '{print $2}'   # chỉ còn munge*
+which sinfo || echo "OK: không còn sinfo hệ thống"
+```
+
+⚠️ **Giữ lại `munge`** — Slurm cần nó để authenticate.
+
+### 0.3.3. PATH
+
+```bash
+cat >> /workspace/tts/env.sh <<'EOF'
+export PATH=/opt/slurm/bin:/opt/slurm/sbin:$PATH
+EOF
+source /workspace/tts/env.sh
+which sinfo sbatch     # phải trỏ /opt/slurm/bin
+```
+
+### 0.3.4. Munge
 
 ```bash
 dd if=/dev/urandom bs=1 count=1024 > /etc/munge/munge.key 2>/dev/null
-chown munge:munge /etc/munge/munge.key
-chmod 400 /etc/munge/munge.key
+chown munge:munge /etc/munge/munge.key && chmod 400 /etc/munge/munge.key
 mkdir -p /run/munge /var/log/munge /var/lib/munge
 chown -R munge:munge /etc/munge /run/munge /var/log/munge /var/lib/munge
 
 sudo -u munge /usr/sbin/munged
-munge -n | unmunge | head -6      # STATUS: Success (0) là đạt
+munge -n | unmunge | head -6      # STATUS: Success (0)
 ```
 
-> Không có systemd (PID 1 của container là `bash`), nên `systemctl start munge` sẽ thất bại. Ta chạy daemon trực tiếp.
+### 0.3.5. Cây cgroup giả
 
-### 0.3.3. `slurm.conf`
+Slurm 23.02 vẫn đòi khởi tạo cgroup. Ta trỏ nó vào một cây thư mục thường, ngoài `/sys/fs/cgroup` (read-only).
 
 ```bash
+mkdir -p /var/lib/slurmcg
+for c in freezer cpuset memory devices cpuacct cpu blkio; do
+  mkdir -p /var/lib/slurmcg/$c
+  : > /var/lib/slurmcg/$c/tasks
+  : > /var/lib/slurmcg/$c/cgroup.procs
+  : > /var/lib/slurmcg/$c/release_agent
+  : > /var/lib/slurmcg/$c/notify_on_release
+done
+
+cat > /etc/slurm/cgroup.conf <<'EOF'
+CgroupPlugin=cgroup/v1
+CgroupMountpoint=/var/lib/slurmcg
+ConstrainCores=no
+ConstrainRAMSpace=no
+ConstrainDevices=no
+EOF
+```
+
+> Đặt ở `/var/lib` chứ không `/run` vì `/run` là tmpfs, mất sau khi restart container. `Constrain*=no` vì không enforce được gì thật — đây chỉ là vỏ để plugin khởi tạo xong.
+
+### 0.3.6. `slurm.conf`
+
+```bash
+mkdir -p /etc/slurm /var/spool/slurmctld /var/spool/slurmd /var/log/slurm
+rm -f /var/spool/slurmctld/clustername    # tránh CLUSTER NAME MISMATCH từ config cũ của gói apt
+
 cat > /etc/slurm/slurm.conf <<'EOF'
 ClusterName=vastbox
 SlurmctldHost=localhost(127.0.0.1)
@@ -269,17 +354,15 @@ SlurmdPidFile=/run/slurmd.pid
 SlurmctldLogFile=/var/log/slurm/slurmctld.log
 SlurmdLogFile=/var/log/slurm/slurmd.log
 
-# Container unprivileged: KHÔNG ghi được cgroup → không dùng plugin cgroup
 ProctrackType=proctrack/linuxproc
 TaskPlugin=task/none
+MpiDefault=none
 
 SchedulerType=sched/backfill
 SelectType=select/cons_tres
 SelectTypeParameters=CR_CPU_Memory
 GresTypes=gpu
 
-# sacct cần slurmdbd + MySQL (quá nặng cho box này).
-# jobcomp/filetxt cho ta lịch sử job ở dạng file, đủ để practice.
 JobCompType=jobcomp/filetxt
 JobCompLoc=/var/log/slurm/jobcomp.log
 AccountingStorageType=accounting_storage/none
@@ -292,40 +375,37 @@ MinJobAge=300
 KillWait=30
 MaxJobCount=1000
 
-NodeName=localhost NodeAddr=127.0.0.1 CPUs=16 RealMemory=56000 Gres=gpu:rtx5070ti:1 State=UNKNOWN
+NodeName=localhost NodeAddr=127.0.0.1 CPUs=64 Sockets=1 CoresPerSocket=32 ThreadsPerCore=2 RealMemory=240000 Gres=gpu:rtx5080:1 State=UNKNOWN
 PartitionName=main Nodes=localhost Default=YES State=UP DefaultTime=01:00:00 MaxTime=12:00:00
 EOF
 ```
 
-Hai dòng cuối là chỗ đáng đọc kỹ:
+Bốn dòng đáng đọc kỹ:
 
 | Thiết lập | Ý nghĩa |
 |---|---|
-| `Gres=gpu:rtx5070ti:1` | khai báo có đúng 1 GPU → submit 2 job cùng xin GPU là job thứ hai phải xếp hàng |
-| `RealMemory=56000` | 56 GB (chừa headroom từ 62 GB) |
+| `Gres=gpu:rtx5080:1` | đúng 1 GPU → submit 2 job cùng xin GPU là job thứ hai xếp hàng |
+| `CPUs=64 Sockets=1 CoresPerSocket=32 ThreadsPerCore=2` | **phải khớp `lscpu`**, lệch là slurmd báo `Node configuration differs from hardware` |
 | `DefaultTime=01:00:00` | quên `--time` thì mặc định 1 tiếng, **không phải vô hạn** |
-| `MaxTime=12:00:00` | trần cứng — cố ý sửa lỗi thiết kế của cluster cũ |
+| `MaxTime=12:00:00` | trần cứng — cố ý sửa lỗi thiết kế của cluster HPC cũ |
 
-### 0.3.4. `gres.conf`
+### 0.3.7. `gres.conf`
 
 ```bash
 cat > /etc/slurm/gres.conf <<'EOF'
-NodeName=localhost Name=gpu Type=rtx5070ti Count=1
+NodeName=localhost Name=gpu Type=rtx5080 File=/dev/nvidia0 Count=1
 EOF
 ```
 
-> Không khai `File=/dev/nvidiaN` vì container chỉ thấy 1 GPU và ánh xạ device node không chắc chắn. Với 1 GPU, `Count=1` là đủ và an toàn hơn.
+⚠️ **`File=` là bắt buộc.** Bỏ ra thì Slurm báo `Ignoring file-less GPU ... from final GRES list` rồi đặt node sang `INVAL` với lý do `gres/gpu count reported lower than configured (0 < 1)`. Đã gặp và kiểm chứng.
 
-### 0.3.5. Thư mục + khởi động
+> Container thấy `/dev/nvidia0..6` (device node của host) nhưng `nvidia-smi` chỉ thấy 1 GPU. `File=/dev/nvidia0` là đủ: Slurm chỉ cần file tồn tại để đếm, còn `CUDA_VISIBLE_DEVICES=0` nó set sẽ trỏ đúng GPU duy nhất container nhìn thấy.
+
+### 0.3.8. Khởi động
 
 ```bash
-mkdir -p /var/spool/slurmctld /var/spool/slurmd /var/log/slurm
-
-/usr/sbin/slurmctld
-sleep 2
-/usr/sbin/slurmd -N localhost
-sleep 2
-
+/opt/slurm/sbin/slurmctld && sleep 3
+/opt/slurm/sbin/slurmd -N localhost && sleep 3
 sinfo
 ```
 
@@ -335,18 +415,14 @@ PARTITION AVAIL  TIMELIMIT  NODES  STATE NODELIST
 main*        up   12:00:00      1   idle localhost
 ```
 
-Nếu `STATE` là `down` hoặc `drain`:
+Nếu `STATE` là `unk`, `down`, `drain` hay `inval`:
 ```bash
-tail -30 /var/log/slurm/slurmctld.log
 tail -30 /var/log/slurm/slurmd.log
+tail -30 /var/log/slurm/slurmctld.log
 scontrol update NodeName=localhost State=RESUME    # sau khi đã sửa nguyên nhân
 ```
 
-📥 Dán log cho tôi nếu vướng — bước này hay lỗi vặt về quyền/thư mục.
-
-### 0.3.6. Cho daemon sống qua disconnect (supervisor)
-
-Image này dùng **supervisor** để quản long-running process. Đăng ký Slurm vào đó thì daemon tự chạy lại sau `stop/start` instance:
+### 0.3.9. Cho daemon sống qua restart (supervisor)
 
 ```bash
 cat > /etc/supervisor/conf.d/slurm.conf <<'EOF'
@@ -358,27 +434,27 @@ autorestart=true
 priority=10
 
 [program:slurmctld]
-command=/usr/sbin/slurmctld -D
+command=/opt/slurm/sbin/slurmctld -D
 autostart=true
 autorestart=true
 priority=20
 
 [program:slurmd]
-command=/usr/sbin/slurmd -D -N localhost
+command=/opt/slurm/sbin/slurmd -D -N localhost
 autostart=true
 autorestart=true
 priority=30
 EOF
 
-pkill slurmctld; pkill slurmd; pkill munged; sleep 2
+pkill -x slurmctld; pkill -x slurmd; pkill -x munged; sleep 2
 supervisorctl reread && supervisorctl update
 supervisorctl status | grep -E "munged|slurm"
 sinfo
 ```
 
-> Đừng `supervisorctl stop caddy / instance_portal / tunnel_manager` — đó là lớp quản lý và auth của Vast.
+> ⚠️ Dùng `pkill -x` (khớp **tên tiến trình**), **không** `pkill -f` (khớp cả dòng lệnh) — `pkill -f slurmctld` sẽ giết luôn cái shell đang chạy nó nếu dòng lệnh chứa chữ đó. Tôi đã dính bẫy này khi debug.
 
----
+> Đừng `supervisorctl stop caddy / instance_portal / tunnel_manager` — đó là lớp quản lý và auth của Vast.
 
 ## 0.4. Practice Slurm — bốn bài, làm hết
 
