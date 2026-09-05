@@ -187,7 +187,7 @@ Ta cố ý **không** chạy trực tiếp `python infer.py`. Mọi thứ đi qu
 ## 0.1. Kết nối
 
 ```bash
-ssh -p 52162 root@182.224.239.168 -L 8080:localhost:8080
+ssh -p 33308 root@14.227.95.149 -L 8080:localhost:8080
 tmux new -s tts
 ```
 
@@ -793,7 +793,7 @@ tail -f $TTS_ROOT/bench/logs/p0-smoke_*.out
 Nghe thử — chạy trên **máy local**:
 
 ```bash
-scp -P 52162 root@182.224.239.168:/workspace/tts/outputs/phase0/vi_auto.wav .
+scp -P 33308 root@14.227.95.149:/workspace/tts/outputs/phase0/vi_auto.wav .
 ```
 
 ## ✅ Checklist Phase 0

@@ -245,7 +245,7 @@ rmsnorm / silu_and_mul: OK
 
 ```bash
 # vào instance
-ssh -p 52162 root@182.224.239.168 -L 8080:localhost:8080
+ssh -p 33308 root@14.227.95.149 -L 8080:localhost:8080
 tmux a -t tts || tmux new -s tts
 source /workspace/tts/env.sh
 
