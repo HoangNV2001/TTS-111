@@ -818,51 +818,175 @@ scp -P 33308 root@14.227.95.149:/workspace/tts/outputs/phase0/vi_auto.wav .
 
 ### 1.1. Chuẩn bị reference audio để voice cloning
 
-Cần 1 file wav tiếng Việt sạch, 3–10 giây, kèm transcript chính xác. Ba cách:
+Cần 1 file wav tiếng Việt sạch, **3–10 giây**, kèm transcript chính xác. Ta lấy từ **VieNeu-TTS-140h** (Apache-2.0, 140.7 h, 193 speaker).
 
-```bash
-mkdir -p $TTS_ROOT/datasets/ref
+#### 1.1.0. ⚠️ Không tải cả dataset
+
+```text
+Tổng dataset : 24.0 GB  (49 shard arrow, mỗi shard ~485 MB)
+Đĩa còn      : ~19 GB
 ```
 
-**Cách A — tự thu** (tốt nhất, giọng bạn, không vướng license): thu trên máy local, rồi
+Tải hết là vỡ đĩa. Ta chỉ lấy **1 shard + 2 file metadata** ≈ 486 MB.
+
+Dataset ở định dạng `save_to_disk` (`state.json` + `dataset_info.json` + `data-XXXXX-of-00049.arrow`), nên đọc bằng `Dataset.from_file()` chứ không phải `load_dataset()`.
+
+#### 1.1.1. Chấp nhận điều khoản + đưa token lên server
+
+Dataset là `gated: auto` — duyệt tự động, nhưng bạn phải bấm đồng ý **một lần** khi đã đăng nhập:
+
+> https://huggingface.co/datasets/pnnbao-ump/VieNeu-TTS-140h
+
+Rồi đưa token lên server. Chạy trên **máy local**:
+
 ```bash
-# chạy trên máy local
-scp myvoice.wav hoangnv242@10.254.152.71:/workspace/tts/datasets/ref/
+scp -P 33308 secrets/hf_PAT.txt root@14.227.95.149:/workspace/tts/.hf_token
+ssh -p 33308 root@14.227.95.149 'chmod 600 /workspace/tts/.hf_token'
 ```
 
-**Cách B — lấy 1 sample từ VieNeu-TTS-140h** (Apache-2.0 theo dataset card):
+Trên server, thêm vào `env.sh`:
+
 ```bash
-uv pip install datasets soundfile
-python - <<'EOF'
-from datasets import load_dataset
-import soundfile as sf, os
-ds = load_dataset("pnnbao-ump/VieNeu-TTS-140h", split="train", streaming=True)
-os.makedirs("/workspace/tts/datasets/ref", exist_ok=True)
-for i, x in enumerate(ds):
-    if i >= 3: break
-    print(i, {k: (type(v).__name__ if k=="audio" else v) for k,v in x.items()})
+cat >> /workspace/tts/env.sh <<'EOF'
+export HF_TOKEN=$(tr -d "\n\r" < /workspace/tts/.hf_token)
 EOF
+source /workspace/tts/env.sh
+python -c "
+from huggingface_hub import whoami
+print('logged in as:', whoami()['name'])
+"
 ```
-> In ra schema trước rồi mới ghi file — tên cột (`audio`/`text`/`transcription`) tuỳ dataset, đừng đoán.
 
-**Cách C — dùng chính output auto-voice ở Phase 0** làm ref tạm để chạy pipeline thông trước, rồi thay bằng audio thật sau.
+> 🔒 **Đừng `echo \$HF_TOKEN`.** Nó sẽ nằm lại trong `~/.bash_history`, trong log `sbatch`, và trong scrollback. Kiểm tra bằng `whoami()` như trên là đủ.
+>
+> Token nằm ngoài git (`secrets/` đã trong `.gitignore`), và trên server nằm ở `/workspace/tts/.hf_token` chmod 600 — **không** commit đường dẫn này vào repo dưới dạng nội dung.
 
-Chuẩn hoá format (OmniVoice sinh ở 24 kHz):
+#### 1.1.2. Tải 1 shard
+
 ```bash
-ffmpeg -i input.wav -ar 24000 -ac 1 -c:a pcm_s16le $TTS_ROOT/datasets/ref/vi_ref_01.wav
-soxi $TTS_ROOT/datasets/ref/vi_ref_01.wav
+mkdir -p $TTS_ROOT/datasets/vieneu
+cat > $TTS_ROOT/bench/fetch_vieneu_shard.py <<'EOF'
+from huggingface_hub import hf_hub_download
+import os
+REPO = "pnnbao-ump/VieNeu-TTS-140h"
+DST  = "/workspace/tts/datasets/vieneu"
+for f in ["dataset_info.json", "state.json", "data-00000-of-00049.arrow"]:
+    p = hf_hub_download(REPO, f, repo_type="dataset", local_dir=DST)
+    print(f"{f:32} {os.path.getsize(p)/1e6:8.1f} MB")
+EOF
+
+srun --time=00:30:00 --gres=gpu:0 --cpus-per-task=8 \
+  python $TTS_ROOT/bench/fetch_vieneu_shard.py
+df -h /
 ```
+
+> `--gres=gpu:0` — bước này chỉ tải mạng, không cần GPU. Nhường GPU cho job khác là thói quen đúng.
+
+#### 1.1.3. Schema thật (đã khảo sát)
+
+```text
+_id             string
+audio           Audio(decode=False)   -> dict {bytes, path}   ← KHÔNG có 'array'/'sampling_rate'
+text            string
+phonemized_text string
+duration        float32
+speaker         string
+gender          string
+language        string
+```
+
+Hai điều quan trọng:
+
+**`decode=False`.** Cột `audio` trả về dict thô `{bytes, path}`, phải tự giải mã:
+```python
+import io, soundfile as sf
+wav, sr = sf.read(io.BytesIO(r["audio"]["bytes"]), dtype="float32")
+```
+Viết `r["audio"]["array"]` sẽ ra `KeyError: 'array'`. (`datasets` 5.x không tự decode ở định dạng `save_to_disk` này.)
+
+**Audio gốc đã là 24 kHz mono** — trùng đúng sample rate đầu ra của OmniVoice, nên **không cần resample bằng ffmpeg**.
+
+Thống kê shard 0:
+```text
+1508 dòng · 192 speaker · 1004 male / 504 female
+duration min/median/max = 3.00 / 5.93 / 14.95 s
+853 mẫu nằm trong khoảng 4-8 s
+```
+
+Dataset có sẵn `duration`, `speaker`, `gender` → lọc chính xác, không cần đoán.
+
+Muốn tự xem lại:
+```bash
+srun --time=00:10:00 --gres=gpu:0 python -c "
+from datasets import Dataset
+ds = Dataset.from_file('$TTS_ROOT/datasets/vieneu/data-00000-of-00049.arrow')
+print(len(ds), 'dòng'); print(ds.features)
+print({k: str(v)[:60] for k,v in ds[0].items()})
+"
+```
+
+#### 1.1.4. Chọn sample tốt và xuất wav
+
+Script `$TTS_ROOT/bench/pick_ref.py` (đã có sẵn trên server) lọc theo:
+
+| Tiêu chí | Ngưỡng | Vì sao |
+|---|---|---|
+| `duration` | 4–8 s | đủ để clone, upstream khuyên 3–10 s |
+| độ dài `text` | 20–200 ký tự | có nội dung, không phải mẩu vụn |
+| `peak` | < 0.99 | loại file bị clip |
+| `peak` | > 0.15 | loại file thu quá nhỏ |
+| SNR thô | xếp hạng | RMS toàn tín hiệu / RMS 10% mẫu nhỏ nhất |
+| speaker | không trùng | 6 ứng viên = 6 người khác nhau |
+
+Xuất **3 nam + 3 nữ**, mỗi người một speaker khác nhau:
+
+```bash
+srun --time=00:20:00 --gres=gpu:0 --cpus-per-task=8 python $TTS_ROOT/bench/pick_ref.py
+```
+
+Nghe trên máy local rồi chọn:
+
+```bash
+scp -P 33308 'root@14.227.95.149:/workspace/tts/datasets/ref/cand*.wav' .
+```
+
+Tiêu chí tai người: **giọng rõ, không nhiễu, không nhạc nền, một người nói, đọc trôi chảy, và transcript khớp đúng từng chữ**.
+
+Chốt xong thì đặt tên chuẩn (không cần ffmpeg vì đã 24 kHz mono):
+
+```bash
+cp $TTS_ROOT/datasets/ref/cand2_female.wav $TTS_ROOT/datasets/ref/vi_ref_01.wav   # đổi theo lựa chọn
+soxi $TTS_ROOT/datasets/ref/vi_ref_01.wav
+
+python -c "
+import json
+m = json.load(open('$TTS_ROOT/datasets/ref/candidates.json'))
+c = [x for x in m if x['file'].endswith('cand2_female.wav')][0]   # đổi theo lựa chọn
+print('REF_TEXT =', repr(c['text']))
+print('speaker  =', c['speaker'], '| gender =', c['gender'], '| dur =', round(c['dur'],2))
+"
+```
+
+📌 Chép chính xác `REF_TEXT` — mọi bước sau dùng lại. **Transcript sai một chữ là voice cloning kém đi**, và bạn sẽ tưởng model dở.
 
 ### 1.2. Voice cloning một câu
 
 ```bash
+mkdir -p $TTS_ROOT/outputs/phase1      # soundfile KHÔNG tự tạo thư mục
+
 omnivoice-infer \
   --model k2-fsa/OmniVoice \
   --text "Hôm nay tôi bắt đầu học về tối ưu suy luận cho mô hình tổng hợp tiếng nói." \
   --ref_audio $TTS_ROOT/datasets/ref/vi_ref_01.wav \
-  --ref_text "<transcript chính xác của file ref>" \
+  --ref_text "<REF_TEXT lấy từ candidates.json>" \
   --output $TTS_ROOT/outputs/phase1/clone_01.wav
 ```
+
+> ⚠️ Thiếu `mkdir -p` sẽ chết ở đúng bước cuối, **sau khi** model đã sinh xong audio:
+> ```text
+> soundfile.LibsndfileError: Error opening '.../clone_01.wav': System error.
+> ```
+> Tốn cả lượt inference. Mọi lệnh có `--output`/`--res_dir` đều nên `mkdir -p` trước.
 
 > Bỏ `--ref_text` thì nó tự gọi Whisper transcribe — tiện nhưng **thêm latency và thêm một nguồn sai số**. Khi benchmark luôn đưa `ref_text` tường minh.
 
@@ -875,7 +999,7 @@ mkdir -p $TTS_ROOT/bench
 python - <<'EOF'
 import json, os
 REF = "/workspace/tts/datasets/ref/vi_ref_01.wav"
-REF_TEXT = "<transcript chính xác của file ref>"
+REF_TEXT = "<dán từ candidates.json>"
 short = [
     "Chào bạn.", "Cảm ơn nhiều.", "Tôi không biết.", "Được thôi.", "Hẹn gặp lại.",
 ]
@@ -993,9 +1117,11 @@ Vẫn học đúng tư duy latency-oriented inference, chỉ đổi công cụ. 
 
 ```bash
 cd $TTS_ROOT
+mkdir -p bench/logs outputs
 for FI in false true; do
   for BS in 1 2 4 8; do
     tag="p2_fi${FI}_bs${BS}"
+    mkdir -p outputs/$tag
     echo "=== $tag ==="
     omnivoice-infer-batch \
       --model k2-fsa/OmniVoice \
@@ -1234,7 +1360,7 @@ Sinh test list phân tầng theo độ dài mục tiêu (1/3/5/10/15 s) bằng `
 python - <<'EOF'
 import json
 REF = "/workspace/tts/datasets/ref/vi_ref_01.wav"
-REF_TEXT = "<transcript>"
+REF_TEXT = "<dán từ candidates.json>"
 base = "Hệ thống tổng hợp tiếng nói đang được kiểm tra với nhiều độ dài khác nhau. "
 rows = []
 for d in [1, 3, 5, 10, 15]:
