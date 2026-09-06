@@ -134,7 +134,23 @@ Giá trị mặc định dùng trong repo này:
 
 → Phase 0–1 chủ yếu `srun`. Phase 2 trở đi, các sweep dài nên chuyển sang `sbatch`.
 
-### 2.3. Reflex khi rời máy
+### 2.3. 🔒 Cái gì phải qua Slurm, cái gì không
+
+Quy tắc trên box một máy này:
+
+| Loại việc | Qua Slurm? | Lệnh |
+|---|---|---|
+| Bất cứ thứ gì **chạm GPU** | ✅ bắt buộc | `srun --gres=gpu:1 --time=...` hoặc `sbatch` |
+| Việc nặng CPU/mạng (tải dataset, tiền xử lý audio) | ✅ nên | `srun --gres=gpu:0 --time=...` |
+| Sweep dài, nhiều cấu hình | ✅ dùng `sbatch` | job tự trả tài nguyên khi xong |
+| `grep`/`cat` log, đọc JSON nhỏ, `ls`, `df` | ❌ không cần | gõ thẳng |
+| Sửa file, git, xem `squeue` | ❌ không cần | gõ thẳng |
+
+Lý do GPU **luôn** phải qua Slurm dù chỉ có một máy: đó là cách duy nhất để hàng đợi có ý nghĩa. Chạy thẳng `python train.py` là bạn giành GPU sau lưng scheduler — job đang chờ trong queue sẽ bị bạn cướp mất, và số benchmark đo được lúc đó vô giá trị vì có hai tiến trình dùng chung GPU.
+
+> Khác với HPC thật: ở đây không có login node riêng, nên `grep` một file log không cần xin tài nguyên. Ranh giới là **GPU và việc nặng**, không phải mọi lệnh.
+
+### 2.4. Reflex khi rời máy
 
 ```bash
 exit                                   # trong worker shell — trả tài nguyên ngay
@@ -974,12 +990,13 @@ print('speaker  =', c['speaker'], '| gender =', c['gender'], '| dur =', round(c[
 ```bash
 mkdir -p $TTS_ROOT/outputs/phase1      # soundfile KHÔNG tự tạo thư mục
 
-omnivoice-infer \
-  --model k2-fsa/OmniVoice \
-  --text "Hôm nay tôi bắt đầu học về tối ưu suy luận cho mô hình tổng hợp tiếng nói." \
-  --ref_audio $TTS_ROOT/datasets/ref/vi_ref_01.wav \
-  --ref_text "<REF_TEXT lấy từ candidates.json>" \
-  --output $TTS_ROOT/outputs/phase1/clone_01.wav
+srun --job-name=p1-clone --time=00:30:00 --gres=gpu:1 --cpus-per-task=8 \
+  omnivoice-infer \
+    --model k2-fsa/OmniVoice \
+    --text "Hôm nay tôi bắt đầu học về tối ưu suy luận cho mô hình tổng hợp tiếng nói." \
+    --ref_audio $TTS_ROOT/datasets/ref/vi_ref_01.wav \
+    --ref_text "<REF_TEXT lấy từ candidates.json>" \
+    --output $TTS_ROOT/outputs/phase1/clone_01.wav
 ```
 
 > ⚠️ Thiếu `mkdir -p` sẽ chết ở đúng bước cuối, **sau khi** model đã sinh xong audio:
@@ -993,6 +1010,8 @@ omnivoice-infer \
 ### 1.3. Dựng test list cho batch inference
 
 Đây là input chuẩn của `omnivoice-infer-batch`. Tạo 20 câu tiếng Việt trải đều độ dài:
+
+Việc này nhẹ (chỉ ghi file JSON), không cần Slurm:
 
 ```bash
 mkdir -p $TTS_ROOT/bench
@@ -1030,22 +1049,27 @@ EOF
 
 ### 1.4. Baseline run
 
+Chạm GPU → **qua Slurm**.
+
 ```bash
 cd $TTS_ROOT
 mkdir -p outputs/phase1_base bench/logs
 
-omnivoice-infer-batch \
-  --model k2-fsa/OmniVoice \
-  --test_list bench/vi_smoke.jsonl \
-  --res_dir outputs/phase1_base \
-  --num_step 32 \
-  --batch_size 1 \
-  --warmup 3 \
-  --enable_flashinfer false \
+srun --job-name=p1-base --time=01:00:00 --gres=gpu:1 --cpus-per-task=8 \
+  omnivoice-infer-batch \
+    --model k2-fsa/OmniVoice \
+    --test_list bench/vi_smoke.jsonl \
+    --res_dir outputs/phase1_base \
+    --num_step 32 \
+    --batch_size 1 \
+    --warmup 3 \
+    --enable_flashinfer false \
   2>&1 | tee bench/logs/p1_baseline_bs1.log
 
-grep -E "RTF|Average" bench/logs/p1_baseline_bs1.log | tail -20
+grep -E "RTF|Average" bench/logs/p1_baseline_bs1.log | tail -20     # đọc log, không cần Slurm
 ```
+
+> Dùng `srun` ở đây (không phải `sbatch`) vì bạn muốn xem output chạy trực tiếp. Từ §2.2 trở đi, sweep dài chuyển hết sang `sbatch`.
 
 > `--warmup 3` rất quan trọng. Không warmup thì lần chạy đầu dính JIT/cuDNN autotune và số RTF sẽ sai lệch mạnh.
 
@@ -1094,7 +1118,7 @@ Nếu chưa, quay lại **Phase 0.7** — bước probe sm_120 phải xong trư�
 
 ```bash
 source /workspace/tts/env.sh
-python -c "import flashinfer; print(flashinfer.__version__)"
+srun --time=00:05:00 --gres=gpu:1 python -c "import flashinfer; print(flashinfer.__version__)"
 ```
 
 ⚠️ **Nếu probe 0.7 cho kết quả FlashInfer không hỗ trợ sm_120**, đừng chạy tiếp §2.2. Thay vào đó Phase 2 đổi trục sang:
@@ -1115,30 +1139,19 @@ Vẫn học đúng tư duy latency-oriented inference, chỉ đổi công cụ. 
 
 ### 2.2. Sweep baseline vs FlashInfer
 
-```bash
-cd $TTS_ROOT
-mkdir -p bench/logs outputs
-for FI in false true; do
-  for BS in 1 2 4 8; do
-    tag="p2_fi${FI}_bs${BS}"
-    mkdir -p outputs/$tag
-    echo "=== $tag ==="
-    omnivoice-infer-batch \
-      --model k2-fsa/OmniVoice \
-      --test_list bench/vi_smoke.jsonl \
-      --res_dir outputs/$tag \
-      --num_step 32 \
-      --batch_size $BS \
-      --warmup 3 \
-      --enable_flashinfer $FI \
-      2>&1 | tee bench/logs/$tag.log
-  done
-done
+8 cấu hình × vài phút → **dùng `sbatch`**, đừng ngồi canh. Script đầy đủ ở §2.4; submit rồi đi làm việc khác:
 
-grep -H "Average RTF" bench/logs/p2_*.log
+```bash
+sbatch $TTS_ROOT/slurm/p2_sweep.sbatch
+squeue -o "%.6i %.10j %.2t %.10M %.12l %.20R"
 ```
 
-⏱ 8 lần chạy, mỗi lần vài phút → nên gói vào một `sbatch` thay vì ngồi canh (xem mẫu ở PLAN §2.6).
+Theo dõi và tổng hợp (đọc log, không cần Slurm):
+
+```bash
+tail -f $TTS_ROOT/bench/logs/p2-sweep_*.out
+grep -H "Average RTF" $TTS_ROOT/bench/logs/p2_*.log
+```
 
 ⚠️ **16 GB VRAM, không phải 80 GB.** `batch_size=8` có thể OOM. Chạy tăng dần 1 → 2 → 4 → 8, theo dõi bằng `nvidia-smi` ở window khác. Gặp `CUDA out of memory` thì dừng ở batch lớn nhất chạy được và ghi rõ trần đó vào RESULTS.md — bản thân cái trần cũng là một kết quả.
 
@@ -1205,14 +1218,26 @@ EOF
 Chạy:
 
 ```bash
+cat > $TTS_ROOT/slurm/p2_graph.sbatch <<'EOF'
+#!/bin/bash
+#SBATCH --job-name=p2-graph
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=02:00:00
+#SBATCH --output=/workspace/tts/bench/logs/%x_%j.out
+set -uo pipefail
+source /workspace/tts/env.sh
 cd $TTS_ROOT
 for RT in pytorch flashinfer flashinfer_graph; do
   python bench/bench_graph.py --runtime $RT \
     --test_list bench/vi_smoke.jsonl \
     --num_step 32 --warmup 3 \
-    --out_json bench/logs/p2_graph_$RT.json \
-    2>&1 | tee bench/logs/p2_graph_$RT.log
+    --out_json bench/logs/p2_graph_$RT.json || echo "FAILED: $RT"
 done
+EOF
+
+sbatch $TTS_ROOT/slurm/p2_graph.sbatch
 
 python - <<'EOF'
 import json, glob
@@ -1225,7 +1250,7 @@ EOF
 
 > Script này chưa chắc chạy đúng ngay lần đầu — signature `apply_flashinfer` hoặc `model.generate` có thể khác. Đó là **chủ đích**: đọc traceback rồi mở `omnivoice/models/omnivoice_flashinfer.py` ra sửa chính là phần học được nhiều nhất của Phase 2. Cứ dán lỗi cho tôi.
 
-### 2.6. Gói sweep vào `sbatch`
+### 2.4. Gói sweep vào `sbatch`
 
 Từ Phase 2 trở đi, sweep dài nên chạy bằng `sbatch` — job tự trả tài nguyên khi script xong, không phụ thuộc tmux:
 
@@ -1265,7 +1290,7 @@ squeue
 
 > `|| echo "FAILED: $tag"` để một cấu hình OOM không giết cả sweep.
 
-### 2.4. Đọc code — phần quan trọng nhất
+### 2.5. Đọc code — phần quan trọng nhất
 
 Sau khi có số, đọc để hiểu **tại sao**:
 
@@ -1283,7 +1308,7 @@ Bốn câu hỏi cần trả lời được sau Phase 2:
 3. **Vì sao KV cache không giúp?** — bidirectional + toàn bộ sequence đổi mỗi step.
 4. **CUDA graph chỉ ăn ở batch=1?** — kernel launch overhead vs compute-bound.
 
-### 2.5. Profiling (nếu số lệch nhiều so với upstream)
+### 2.6. Profiling (nếu số lệch nhiều so với upstream)
 
 ```bash
 nsys profile -o $TTS_ROOT/bench/logs/p2_nsys_fi \
@@ -1311,17 +1336,36 @@ nsys profile -o $TTS_ROOT/bench/logs/p2_nsys_fi \
 ### 3.1. `num_step` — knob mạnh nhất sau FlashInfer
 
 ```bash
+cat > $TTS_ROOT/slurm/p3_numstep.sbatch <<'EOF'
+#!/bin/bash
+#SBATCH --job-name=p3-numstep
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=03:00:00
+#SBATCH --output=/workspace/tts/bench/logs/%x_%j.out
+set -uo pipefail
+source /workspace/tts/env.sh
 cd $TTS_ROOT
 for NS in 32 24 16 12 8 4; do
+  mkdir -p outputs/p3_ns${NS}
+  echo "=== num_step=$NS ==="
   omnivoice-infer-batch \
     --model k2-fsa/OmniVoice \
     --test_list bench/vi_smoke.jsonl \
     --res_dir outputs/p3_ns${NS} \
     --num_step $NS --batch_size 4 --warmup 3 \
-    --enable_flashinfer true \
-    2>&1 | tee bench/logs/p3_ns${NS}.log
+    --enable_flashinfer true 2>&1 | tee bench/logs/p3_ns${NS}.log
 done
-grep -H "Average RTF" bench/logs/p3_ns*.log
+EOF
+
+sbatch $TTS_ROOT/slurm/p3_numstep.sbatch
+squeue
+```
+
+Xong thì tổng hợp:
+```bash
+grep -H "Average RTF" $TTS_ROOT/bench/logs/p3_ns*.log
 ```
 
 ⚠️ **Bắt buộc nghe.** RTF giảm tuyến tính theo `num_step` là chuyện hiển nhiên và vô nghĩa nếu chất lượng sập. Nghe ít nhất `ns32`, `ns16`, `ns8` cùng một câu:
@@ -1343,10 +1387,12 @@ Ghi cảm nhận chủ quan vào RESULTS.md trước — Phase 4 mới có WER �
 
 Ví dụ chạy deterministic để đo lặp lại được:
 ```bash
-omnivoice-infer-batch --model k2-fsa/OmniVoice \
-  --test_list bench/vi_smoke.jsonl --res_dir outputs/p3_greedy \
-  --num_step 32 --batch_size 4 --warmup 3 --enable_flashinfer true \
-  --position_temperature 0.0 --class_temperature 0.0 \
+mkdir -p $TTS_ROOT/outputs/p3_greedy
+srun --job-name=p3-greedy --time=01:00:00 --gres=gpu:1 --cpus-per-task=8 \
+  omnivoice-infer-batch --model k2-fsa/OmniVoice \
+    --test_list bench/vi_smoke.jsonl --res_dir outputs/p3_greedy \
+    --num_step 32 --batch_size 4 --warmup 3 --enable_flashinfer true \
+    --position_temperature 0.0 --class_temperature 0.0 \
   2>&1 | tee bench/logs/p3_greedy.log
 ```
 
@@ -1378,15 +1424,31 @@ EOF
 Rồi so **fixed-size batching** vs **duration-based batching** — đây chính là chỗ draft nói team có thể tạo giá trị ngoài upstream:
 
 ```bash
-# fixed batch size: padding waste khi trộn 1s với 15s
+cat > $TTS_ROOT/slurm/p3_batching.sbatch <<'EOF'
+#!/bin/bash
+#SBATCH --job-name=p3-batching
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=02:00:00
+#SBATCH --output=/workspace/tts/bench/logs/%x_%j.out
+set -uo pipefail
+source /workspace/tts/env.sh
+cd $TTS_ROOT
+mkdir -p outputs/p3_fixed8 outputs/p3_durbatch
+
+echo "### fixed batch size: padding waste khi trộn 1s với 15s"
 omnivoice-infer-batch --model k2-fsa/OmniVoice --test_list bench/vi_duration.jsonl \
   --res_dir outputs/p3_fixed8 --batch_size 8 --num_step 32 --warmup 3 \
   --enable_flashinfer true 2>&1 | tee bench/logs/p3_fixed8.log
 
-# duration-based batching (batch_size=0 → dùng batch_duration)
+echo "### duration-based batching (batch_size=0 -> dùng batch_duration)"
 omnivoice-infer-batch --model k2-fsa/OmniVoice --test_list bench/vi_duration.jsonl \
   --res_dir outputs/p3_durbatch --batch_size 0 --batch_duration 120 --num_step 32 --warmup 3 \
   --enable_flashinfer true 2>&1 | tee bench/logs/p3_durbatch.log
+EOF
+
+sbatch $TTS_ROOT/slurm/p3_batching.sbatch
 ```
 
 ### ✅ Checklist Phase 3
@@ -1455,11 +1517,13 @@ Bước này ta sẽ làm cùng nhau — tôi sinh draft, bạn (native speaker)
 Lệnh cụ thể sẽ chốt sau khi đọc `run_eval.sh` ở 4.2. Khung dự kiến:
 
 ```bash
-# 1. sinh audio
-omnivoice-infer-batch --model k2-fsa/OmniVoice \
-  --test_list datasets/vi_eval/vi_eval_v1.jsonl \
-  --res_dir outputs/p4_eval_ns32 --num_step 32 --batch_size 8 \
-  --enable_flashinfer true --position_temperature 0.0 --class_temperature 0.0
+# 1. sinh audio  (dài -> sbatch)
+mkdir -p $TTS_ROOT/outputs/p4_eval_ns32
+srun --job-name=p4-gen --time=04:00:00 --gres=gpu:1 --cpus-per-task=8 \
+  omnivoice-infer-batch --model k2-fsa/OmniVoice \
+    --test_list datasets/vi_eval/vi_eval_v1.jsonl \
+    --res_dir outputs/p4_eval_ns32 --num_step 32 --batch_size 8 \
+    --enable_flashinfer true --position_temperature 0.0 --class_temperature 0.0
 
 # 2. chấm WER/CER + SIM + UTMOS  (module chính xác chốt ở 4.2)
 # 3. lặp lại cho ns16, ns8 → bảng chất lượng vs tốc độ
