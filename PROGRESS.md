@@ -10,9 +10,9 @@
 
 | Phase | Nội dung | Trạng thái | Ngày xong |
 |---|---|---|---|
-| 0 | Environment setup | `[ ]` | |
-| 1 | Baseline PyTorch fp16 | `[ ]` | |
-| 2 | FlashInfer + CUDA Graph | `[ ]` | |
+| 0 | Environment setup | `[x]` | 2026-09-06 |
+| 1 | Baseline PyTorch fp16 | `[x]` | 2026-09-06 |
+| 2 | FlashInfer + CUDA Graph | `[x]` đo xong; còn §2.5 đọc code | 2026-09-06 |
 | 3 | Knob sweep | `[ ]` | |
 | 4 | Vietnamese eval suite | `[ ]` | |
 | 5 | Serving prototype | `[ ]` | |
@@ -207,6 +207,35 @@ rmsnorm / silu_and_mul: OK
 ⚠️ **1.19× là một op đơn lẻ, KHÔNG phải 2.1-2.6× của upstream.** Con số upstream đến từ cả pipeline (CFG packing bỏ padding + fused kernels + CUDA graph). Phase 2 phải đo end-to-end.
 
 **Bước tiếp theo:** §0.8 smoke test OmniVoice qua sbatch → Phase 1.
+
+---
+
+### 2026-09-06 (chiều) — Đo xong Phase 1 + Phase 2, RESULTS.md đã điền
+
+**Sửa trước khi đo:** `vi_smoke.jsonl` còn nguyên placeholder `<dán từ candidates.json>` ở `ref_text` cả 12 dòng → baseline cũ (RTF 0.2185, tổng audio 101.32 s) **vô hiệu**. Dò MD5 xác định `vi_ref_01.wav` = `cand2_female.wav` (spk `jellyfish1010_1082`, nữ, 5.13 s), điền transcript đúng, lưu `datasets/ref/chosen_ref.json`.
+
+**Đã chạy:** job Slurm 34 (`slurm/p12_bench.sbatch`) — 11 cấu hình, greedy, warmup 3, kèm watcher `nvidia-smi` lấy peak VRAM.
+
+**Kết quả chính:**
+
+| batch | baseline | FlashInfer | speedup | upstream H100 |
+|---|---|---|---|---|
+| 1 | 0.4648 | 0.2404 | 1.93× | 2.1× |
+| 1+graph | 0.4477 | 0.1839 | **2.43×** | 2.4× |
+| 2 | 0.2398 | 0.1345 | 1.78× | 2.0× |
+| 4 | 0.1411 | 0.0836 | 1.69× | 2.2× |
+| 8 | 0.1554 | 0.0658 | 2.36× | 2.6× |
+
+→ **Reproduce được xu hướng upstream.** Cấu hình batch=1+CUDA graph khớp gần như chính xác (2.43× vs 2.4×).
+
+**Ba quan sát đáng đào tiếp:**
+1. **bs=8 tệ hơn bs=4 ở baseline** (0.1554 vs 0.1411) — test set 12 câu chia 8+4, batch cuối lấp nửa GPU. Cần test set ≥64 câu mới kết luận chắc.
+2. **CUDA graph: p50 tốt nhất (0.858 s) nhưng p95 xấu hơn flashinfer thường** (1.055 vs 1.008). Nghi do capture lại theo bucket độ dài. Quan trọng cho Phase 5 vì realtime quan tâm p95.
+3. **VRAM chưa chạm trần**: cao nhất 4.03 GB / 16 GB. Còn dư địa tăng batch nhiều.
+
+**Còn lại của Phase 2:** §2.5 đọc code (4 câu hỏi về CFG packing / ragged attention / vì sao KV cache không giúp / vì sao graph chỉ ăn ở batch=1) — phần này người dùng tự làm.
+
+**Bước tiếp theo:** Phase 3 knob sweep (`num_step` 32→4), cần nghe để đánh giá chất lượng.
 
 ---
 

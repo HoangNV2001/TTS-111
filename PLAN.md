@@ -1139,23 +1139,94 @@ Vẫn học đúng tư duy latency-oriented inference, chỉ đổi công cụ. 
 
 ### 2.2. Sweep baseline vs FlashInfer
 
-8 cấu hình × vài phút → **dùng `sbatch`**, đừng ngồi canh. Script đầy đủ ở §2.4; submit rồi đi làm việc khác:
+> ✅ **ĐÃ CHẠY** — Slurm job 34, ngày 2026-09-06. Script thật dùng là `slurm/p12_bench.sbatch` (gộp cả §2.2 và §2.3). Kết quả đầy đủ ở [RESULTS.md](RESULTS.md) bảng **B1** và **B2**. Không cần chạy lại; phần dưới giữ để bạn đọc hiểu và tái sử dụng.
+
+Script gộp baseline + FlashInfer + 3 runtime, kèm watcher lấy peak VRAM cho từng cấu hình:
 
 ```bash
-sbatch $TTS_ROOT/slurm/p2_sweep.sbatch
+cat > $TTS_ROOT/slurm/p12_bench.sbatch <<'SBATCH_EOF'
+#!/bin/bash
+#SBATCH --job-name=p12-bench
+#SBATCH --partition=main
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=05:00:00
+#SBATCH --output=/workspace/tts/bench/logs/%x_%j.out
+
+set -uo pipefail
+source /workspace/tts/env.sh
+cd $TTS_ROOT
+mkdir -p bench/logs
+
+vram_watch () {   # $1 = tag  -> lay peak VRAM vi infer_batch khong bao
+  ( while true; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits; sleep 1; done ) \
+    > bench/logs/vram_$1.raw 2>/dev/null &
+  echo $!
+}
+
+run_cli () {      # $1=tag  $2=flashinfer  $3=batch_size
+  local tag=$1 fi=$2 bs=$3
+  mkdir -p outputs/$tag
+  echo "=================== $tag (flashinfer=$fi, bs=$bs) ==================="
+  local w; w=$(vram_watch $tag)
+  omnivoice-infer-batch \
+    --model k2-fsa/OmniVoice \
+    --test_list bench/vi_smoke.jsonl \
+    --res_dir outputs/$tag \
+    --num_step 32 --batch_size $bs --warmup 3 \
+    --enable_flashinfer $fi \
+    --position_temperature 0.0 --class_temperature 0.0 \
+    > bench/logs/$tag.log 2>&1 || echo "FAILED: $tag"
+  kill $w 2>/dev/null
+  grep -E "Total audio duration|Total synthesis time|Average RTF" bench/logs/$tag.log | tail -3
+  echo "peak VRAM MiB: $(sort -n bench/logs/vram_$tag.raw 2>/dev/null | tail -1)"
+  echo
+}
+
+echo "############ B1: PyTorch baseline ############"
+for BS in 1 2 4 8; do run_cli "p1_base_bs${BS}" false $BS; done
+
+echo "############ B2: FlashInfer ############"
+for BS in 1 2 4 8; do run_cli "p2_fi_bs${BS}" true $BS; done
+
+echo "############ B2b: 3 runtime, batch=1 ############"
+for RT in pytorch flashinfer flashinfer_graph; do
+  echo "--------- $RT ---------"
+  w=$(vram_watch "graph_$RT")
+  python bench/bench_graph.py --runtime $RT \
+    --test_list bench/vi_smoke.jsonl --num_step 32 --warmup 3 \
+    --out_json bench/logs/p2_graph_$RT.json 2>&1 | tail -14 || echo "FAILED: $RT"
+  kill $w 2>/dev/null
+  echo
+done
+SBATCH_EOF
+
+sbatch $TTS_ROOT/slurm/p12_bench.sbatch
 squeue -o "%.6i %.10j %.2t %.10M %.12l %.20R"
 ```
+
+Bốn chi tiết đáng để ý trong script:
+
+| Chi tiết | Vì sao |
+|---|---|
+| `--position_temperature 0.0 --class_temperature 0.0` | greedy → chạy lại ra cùng kết quả. Không có thì delta giữa cấu hình có thể chỉ là sampling noise |
+| `--warmup 3` | bỏ qua JIT/cuDNN autotune của lần chạy đầu |
+| `|| echo "FAILED: $tag"` | một cấu hình OOM không giết cả sweep |
+| `vram_watch` | `infer_batch.py` **không** báo VRAM, phải tự poll `nvidia-smi` |
 
 Theo dõi và tổng hợp (đọc log, không cần Slurm):
 
 ```bash
-tail -f $TTS_ROOT/bench/logs/p2-sweep_*.out
-grep -H "Average RTF" $TTS_ROOT/bench/logs/p2_*.log
+tail -f $TTS_ROOT/bench/logs/p12-bench_*.out
+grep -H "Average RTF" $TTS_ROOT/bench/logs/p1_base_*.log $TTS_ROOT/bench/logs/p2_fi_*.log
 ```
 
-⚠️ **16 GB VRAM, không phải 80 GB.** `batch_size=8` có thể OOM. Chạy tăng dần 1 → 2 → 4 → 8, theo dõi bằng `nvidia-smi` ở window khác. Gặp `CUDA out of memory` thì dừng ở batch lớn nhất chạy được và ghi rõ trần đó vào RESULTS.md — bản thân cái trần cũng là một kết quả.
+⚠️ **16 GB VRAM, không phải 80 GB.** Trên thực tế đo được: cao nhất chỉ **4.03 GB**, không cấu hình nào chạm trần — còn dư địa thử `bs=16`/`32`. Nếu gặp `CUDA out of memory` thì dừng ở batch lớn nhất chạy được và ghi trần đó vào RESULTS.md; bản thân cái trần cũng là một kết quả.
 
 ### 2.3. CUDA Graph — phải viết script riêng
+
+> ✅ **ĐÃ CHẠY** cùng job 34. `bench/bench_graph.py` đã có sẵn trên server; kết quả 3 runtime ở [RESULTS.md](RESULTS.md) bảng B2.
 
 ⚠️ **CLI `omnivoice-infer-batch` không có flag `--enable_cuda_graph`.** Nó chỉ gọi `apply_flashinfer(model)` mặc định. Muốn đo cấu hình 2.4× (batch=1 + graph) phải dùng Python API:
 
@@ -1250,47 +1321,7 @@ EOF
 
 > Script này chưa chắc chạy đúng ngay lần đầu — signature `apply_flashinfer` hoặc `model.generate` có thể khác. Đó là **chủ đích**: đọc traceback rồi mở `omnivoice/models/omnivoice_flashinfer.py` ra sửa chính là phần học được nhiều nhất của Phase 2. Cứ dán lỗi cho tôi.
 
-### 2.4. Gói sweep vào `sbatch`
-
-Từ Phase 2 trở đi, sweep dài nên chạy bằng `sbatch` — job tự trả tài nguyên khi script xong, không phụ thuộc tmux:
-
-```bash
-cat > $TTS_ROOT/slurm/p2_sweep.sbatch <<'EOF'
-#!/bin/bash
-#SBATCH --job-name=p2-sweep
-#SBATCH --partition=main
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=04:00:00
-#SBATCH --output=/workspace/tts/bench/logs/%x_%j.out
-
-set -euo pipefail
-source /workspace/tts/env.sh
-cd $TTS_ROOT
-
-for FI in false true; do
-  for BS in 1 2 4 8; do
-    tag="p2_fi${FI}_bs${BS}"
-    echo "=== $tag ==="
-    omnivoice-infer-batch \
-      --model k2-fsa/OmniVoice \
-      --test_list bench/vi_smoke.jsonl \
-      --res_dir outputs/$tag \
-      --num_step 32 --batch_size $BS --warmup 3 \
-      --enable_flashinfer $FI || echo "FAILED: $tag"
-  done
-done
-df -h /
-EOF
-
-sbatch $TTS_ROOT/slurm/p2_sweep.sbatch
-squeue
-```
-
-> `|| echo "FAILED: $tag"` để một cấu hình OOM không giết cả sweep.
-
-### 2.5. Đọc code — phần quan trọng nhất
+### 2.4. Đọc code — phần quan trọng nhất
 
 Sau khi có số, đọc để hiểu **tại sao**:
 
@@ -1308,7 +1339,7 @@ Bốn câu hỏi cần trả lời được sau Phase 2:
 3. **Vì sao KV cache không giúp?** — bidirectional + toàn bộ sequence đổi mỗi step.
 4. **CUDA graph chỉ ăn ở batch=1?** — kernel launch overhead vs compute-bound.
 
-### 2.6. Profiling (nếu số lệch nhiều so với upstream)
+### 2.5. Profiling (nếu số lệch nhiều so với upstream)
 
 ```bash
 nsys profile -o $TTS_ROOT/bench/logs/p2_nsys_fi \
